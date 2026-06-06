@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: router
+    static_configs:
+      - targets:
+          - router:8080
+
+  - job_name: origin
+    static_configs:
+      - targets:
+          - origin:9000
+
+  - job_name: edge
+    static_configs:
+      - targets:
+          - edge-1:9100
+          - edge-2:9100
+          - edge-3:9100

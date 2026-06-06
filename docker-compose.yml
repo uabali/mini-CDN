@@ -1,0 +1,123 @@
+services:
+  origin:
+    build:
+      context: .
+      args:
+        SERVICE: origin
+    environment:
+      PORT: "9000"
+      ORIGIN_ROOT: /data
+    volumes:
+      - ./origin/files:/data:ro
+    expose:
+      - "9000"
+
+  edge-1:
+    build:
+      context: .
+      args:
+        SERVICE: edge
+    environment:
+      PORT: "9100"
+      NODE_NAME: edge-1
+      ORIGIN_BASE_URL: http://origin:9000
+      CACHE_ROOT: /cache
+      CACHE_TTL: 5m
+      CACHE_MAX_BYTES: "524288000"
+    volumes:
+      - edge-1-cache:/cache
+    depends_on:
+      - origin
+    expose:
+      - "9100"
+
+  edge-2:
+    build:
+      context: .
+      args:
+        SERVICE: edge
+    environment:
+      PORT: "9100"
+      NODE_NAME: edge-2
+      ORIGIN_BASE_URL: http://origin:9000
+      CACHE_ROOT: /cache
+      CACHE_TTL: 5m
+      CACHE_MAX_BYTES: "524288000"
+    volumes:
+      - edge-2-cache:/cache
+    depends_on:
+      - origin
+    expose:
+      - "9100"
+
+  edge-3:
+    build:
+      context: .
+      args:
+        SERVICE: edge
+    environment:
+      PORT: "9100"
+      NODE_NAME: edge-3
+      ORIGIN_BASE_URL: http://origin:9000
+      CACHE_ROOT: /cache
+      CACHE_TTL: 5m
+      CACHE_MAX_BYTES: "524288000"
+    volumes:
+      - edge-3-cache:/cache
+    depends_on:
+      - origin
+    expose:
+      - "9100"
+
+  router:
+    build:
+      context: .
+      args:
+        SERVICE: router
+    environment:
+      PORT: "8080"
+      EDGES: http://edge-1:9100,http://edge-2:9100,http://edge-3:9100
+    ports:
+      - "8080:8080"
+    depends_on:
+      - edge-1
+      - edge-2
+      - edge-3
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - router
+      - origin
+      - edge-1
+      - edge-2
+      - edge-3
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  edge-1-cache:
+  edge-2-cache:
+  edge-3-cache:
+  prometheus-data:
+  grafana-data:
