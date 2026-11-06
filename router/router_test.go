@@ -1,11 +1,20 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"mini-cdn/internal/metrics"
 )
+
+func defaultCfg() RouterConfig {
+	return RouterConfig{Strategy: StrategyRoundRobin, VNodes: 50, MaxInFlight: 0}
+}
 
 func TestNextEdgeRoundRobinSkipsUnhealthy(t *testing.T) {
 	t.Parallel()
@@ -14,7 +23,7 @@ func TestNextEdgeRoundRobinSkipsUnhealthy(t *testing.T) {
 		"http://edge-1:9100",
 		"http://edge-2:9100",
 		"http://edge-3:9100",
-	}, metrics.NewRegistry())
+	}, metrics.NewRegistry(), defaultCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +55,123 @@ func TestNextEdgeRoundRobinSkipsUnhealthy(t *testing.T) {
 	}
 }
 
+func TestConsistentHashSameKeySameEdge(t *testing.T) {
+	t.Parallel()
+
+	router, err := NewRouter([]string{
+		"http://edge-1:9100",
+		"http://edge-2:9100",
+		"http://edge-3:9100",
+	}, metrics.NewRegistry(), RouterConfig{Strategy: StrategyConsistent, VNodes: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := router.SelectEdge("/images/test.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		got, err := router.SelectEdge("/images/test.png")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Name != first.Name {
+			t.Fatalf("consistent hash unstable: %s then %s", first.Name, got.Name)
+		}
+	}
+}
+
+func TestConsistentHashDropsUnhealthyFromRing(t *testing.T) {
+	t.Parallel()
+
+	router, err := NewRouter([]string{
+		"http://edge-1:9100",
+		"http://edge-2:9100",
+		"http://edge-3:9100",
+	}, metrics.NewRegistry(), RouterConfig{Strategy: StrategyConsistent, VNodes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := []string{"/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h"}
+	for _, key := range keys {
+		if _, err := router.SelectEdge(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	down := router.byName["edge-2"]
+	router.MarkHealth(down, false)
+
+	for _, key := range keys {
+		edge, err := router.SelectEdge(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if edge.Name == "edge-2" {
+			t.Fatalf("key %s still routed to unhealthy edge-2", key)
+		}
+	}
+}
+
+func TestLoadShedReturns503(t *testing.T) {
+	t.Parallel()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	router, err := NewRouter([]string{backend.URL}, metrics.NewRegistry(), RouterConfig{
+		Strategy:    StrategyRoundRobin,
+		MaxInFlight: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var shedCount atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/images/test.png", nil)
+			router.Proxy(rec, req)
+			if rec.Code == http.StatusServiceUnavailable {
+				shedCount.Add(1)
+				if rec.Header().Get("X-Load-Shed") != "1" {
+					t.Errorf("missing X-Load-Shed header")
+				}
+				if rec.Header().Get("Retry-After") == "" {
+					t.Errorf("missing Retry-After header")
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if shedCount.Load() == 0 {
+		t.Fatal("expected at least one shed response")
+	}
+}
+
 func TestNewRouterRejectsEmptyEdges(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewRouter(nil, metrics.NewRegistry()); err == nil {
+	if _, err := NewRouter(nil, metrics.NewRegistry(), defaultCfg()); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestNewRouterRejectsBadStrategy(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewRouter([]string{"http://edge-1:9100"}, metrics.NewRegistry(), RouterConfig{Strategy: "random"}); err == nil {
 		t.Fatal("expected error")
 	}
 }
