@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mini-cdn/internal/metrics"
@@ -19,9 +20,11 @@ func main() {
 	cacheRoot := env("CACHE_ROOT", "./cache")
 	ttl := durationEnv("CACHE_TTL", 5*time.Minute)
 	maxBytes := bytesEnv("CACHE_MAX_BYTES", 500*1024*1024)
+	maxInFlight := intEnv("MAX_INFLIGHT", 0)
 
 	registry := metrics.NewRegistry()
 	cache := NewDiskCache(cacheRoot, originBase, nodeName, ttl, maxBytes, registry)
+	var inflight atomic.Int64
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -65,6 +68,17 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if maxInFlight > 0 {
+			current := inflight.Add(1)
+			defer inflight.Add(-1)
+			if current > int64(maxInFlight) {
+				registry.Inc("cdn_load_shed_total", map[string]string{"component": "edge", "edge": nodeName})
+				w.Header().Set("Retry-After", "1")
+				w.Header().Set("X-Load-Shed", "1")
+				http.Error(w, "overloaded", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		cleanPath, err := safepath.CleanRequestPath(r.URL.Path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -73,7 +87,8 @@ func main() {
 		cache.ServeFile(w, r, cleanPath)
 	})
 
-	log.Printf("%s listening on :%s, origin=%s, ttl=%s, max_bytes=%d", nodeName, port, originBase, ttl, maxBytes)
+	log.Printf("%s listening on :%s, origin=%s, ttl=%s, max_bytes=%d, max_inflight=%d",
+		nodeName, port, originBase, ttl, maxBytes, maxInFlight)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -104,6 +119,18 @@ func bytesEnv(key string, fallback int64) int64 {
 		return fallback
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func intEnv(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return fallback
 	}

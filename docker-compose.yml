@@ -24,6 +24,7 @@ services:
       CACHE_ROOT: /cache
       CACHE_TTL: 5m
       CACHE_MAX_BYTES: "524288000"
+      MAX_INFLIGHT: "32"
     volumes:
       - edge-1-cache:/cache
     depends_on:
@@ -43,6 +44,7 @@ services:
       CACHE_ROOT: /cache
       CACHE_TTL: 5m
       CACHE_MAX_BYTES: "524288000"
+      MAX_INFLIGHT: "32"
     volumes:
       - edge-2-cache:/cache
     depends_on:
@@ -62,6 +64,7 @@ services:
       CACHE_ROOT: /cache
       CACHE_TTL: 5m
       CACHE_MAX_BYTES: "524288000"
+      MAX_INFLIGHT: "32"
     volumes:
       - edge-3-cache:/cache
     depends_on:
@@ -77,6 +80,9 @@ services:
     environment:
       PORT: "8080"
       EDGES: http://edge-1:9100,http://edge-2:9100,http://edge-3:9100
+      ROUTER_STRATEGY: consistent
+      HASH_VNODES: "100"
+      MAX_INFLIGHT: "64"
     ports:
       - "8080:8080"
     depends_on:

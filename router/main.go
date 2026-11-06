@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +16,11 @@ func main() {
 	rawEdges := splitCSV(env("EDGES", "http://edge-1:9100,http://edge-2:9100,http://edge-3:9100"))
 	registry := metrics.NewRegistry()
 
-	router, err := NewRouter(rawEdges, registry)
+	router, err := NewRouter(rawEdges, registry, RouterConfig{
+		Strategy:    env("ROUTER_STRATEGY", StrategyConsistent),
+		VNodes:      intEnv("HASH_VNODES", 100),
+		MaxInFlight: intEnv("MAX_INFLIGHT", 0),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -46,7 +51,8 @@ func main() {
 	})
 	mux.HandleFunc("/", router.Proxy)
 
-	log.Printf("router listening on :%s with edges %s", port, strings.Join(rawEdges, ","))
+	log.Printf("router listening on :%s strategy=%s max_inflight=%d edges=%s",
+		port, router.Strategy(), intEnv("MAX_INFLIGHT", 0), strings.Join(rawEdges, ","))
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -57,6 +63,18 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func intEnv(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func splitCSV(value string) []string {
