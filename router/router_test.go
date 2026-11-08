@@ -188,3 +188,58 @@ func TestEdgeTargetNamesUseHostnames(t *testing.T) {
 		t.Fatalf("edge name = %q", edge.Name)
 	}
 }
+
+func TestSameHostDifferentPortsStayOnTheRing(t *testing.T) {
+	t.Parallel()
+
+	router, err := NewRouter([]string{
+		"http://127.0.0.1:9101",
+		"http://127.0.0.1:9102",
+	}, metrics.NewRegistry(), RouterConfig{Strategy: StrategyConsistent, VNodes: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if router.ring.Len() != 2 {
+		t.Fatalf("ring len = %d, want 2 (hosts must not collapse)", router.ring.Len())
+	}
+	members := router.ring.Members()
+	if len(members) != 2 || members[0] == members[1] {
+		t.Fatalf("members = %v", members)
+	}
+}
+
+func TestGetFailsOverOnceWhenFirstEdgeIsDown(t *testing.T) {
+	t.Parallel()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("from-good"))
+	}))
+	defer good.Close()
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("from-bad"))
+	}))
+	badURL := bad.URL
+	bad.Close()
+
+	router, err := NewRouter([]string{badURL, good.URL}, metrics.NewRegistry(), RouterConfig{
+		Strategy:    StrategyRoundRobin,
+		MaxInFlight: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/images/test.png", nil)
+	router.Proxy(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "from-good" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if rec.Header().Get("X-Edge-Failover") == "" {
+		t.Fatal("expected X-Edge-Failover")
+	}
+}

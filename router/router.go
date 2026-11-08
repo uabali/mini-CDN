@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -15,8 +17,8 @@ import (
 )
 
 const (
-	StrategyRoundRobin  = "roundrobin"
-	StrategyConsistent  = "consistent"
+	StrategyRoundRobin = "roundrobin"
+	StrategyConsistent = "consistent"
 )
 
 type EdgeTarget struct {
@@ -26,8 +28,8 @@ type EdgeTarget struct {
 }
 
 type RouterConfig struct {
-	Strategy   string
-	VNodes     int
+	Strategy    string
+	VNodes      int
 	MaxInFlight int
 }
 
@@ -53,15 +55,26 @@ func NewRouter(rawEdges []string, registry *metrics.Registry, cfg RouterConfig) 
 		return nil, errors.New("strategy must be consistent or roundrobin")
 	}
 
-	edges := make([]*EdgeTarget, 0, len(rawEdges))
-	byName := make(map[string]*EdgeTarget, len(rawEdges))
+	parsedURLs := make([]*url.URL, 0, len(rawEdges))
 	for _, raw := range rawEdges {
 		parsed, err := url.Parse(raw)
 		if err != nil {
 			return nil, err
 		}
+		if parsed.Hostname() == "" {
+			return nil, fmt.Errorf("edge URL %q has no host", raw)
+		}
+		parsedURLs = append(parsedURLs, parsed)
+	}
+	names := edgeNames(parsedURLs)
+	edges := make([]*EdgeTarget, 0, len(parsedURLs))
+	byName := make(map[string]*EdgeTarget, len(parsedURLs))
+	for i, parsed := range parsedURLs {
+		if _, exists := byName[names[i]]; exists {
+			return nil, fmt.Errorf("duplicate edge %q", names[i])
+		}
 		edge := &EdgeTarget{
-			Name:    parsed.Hostname(),
+			Name:    names[i],
 			URL:     parsed,
 			Healthy: true,
 		}
@@ -229,20 +242,65 @@ func (r *Router) Proxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	w.Header().Set("X-Router-Strategy", r.strategy)
+	r.proxyTo(w, req, edge)
+}
+
+type failoverKey struct{}
+
+func (r *Router) proxyTo(w http.ResponseWriter, req *http.Request, edge *EdgeTarget) {
 	proxy := httputil.NewSingleHostReverseProxy(edge.URL)
 	originalDirector := proxy.Director
 	proxy.Director = func(out *http.Request) {
 		originalDirector(out)
 		out.Host = edge.URL.Host
 	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+	proxy.ErrorHandler = func(w http.ResponseWriter, outReq *http.Request, _ error) {
 		r.MarkHealth(edge, false)
+		// One GET/HEAD retry. The failed attempt has not written a response yet
+		// (ReverseProxy calls ErrorHandler only when RoundTrip fails).
+		if outReq.Context().Value(failoverKey{}) == nil && (outReq.Method == http.MethodGet || outReq.Method == http.MethodHead) {
+			next, selErr := r.SelectEdge(outReq.URL.Path)
+			if selErr == nil && next.Name != edge.Name {
+				w.Header().Set("X-Edge-Failover", edge.Name)
+				retry := outReq.Clone(context.WithValue(outReq.Context(), failoverKey{}, true))
+				r.proxyTo(w, retry, next)
+				return
+			}
+		}
 		http.Error(w, "edge unavailable", http.StatusBadGateway)
 	}
 
-	w.Header().Set("X-Router-Strategy", r.strategy)
 	w.Header().Set("X-Edge-Selected", edge.Name)
 	proxy.ServeHTTP(w, req)
+}
+
+// edgeNames uses the hostname when it is unique. Repeated hostnames (two local
+// ports) keep host:port so the ring cannot collapse them into one member.
+func edgeNames(urls []*url.URL) []string {
+	counts := make(map[string]int, len(urls))
+	hosts := make([]string, len(urls))
+	for i, u := range urls {
+		hosts[i] = u.Hostname()
+		counts[hosts[i]]++
+	}
+	names := make([]string, len(urls))
+	for i, u := range urls {
+		if counts[hosts[i]] == 1 {
+			names[i] = hosts[i]
+			continue
+		}
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		names[i] = hosts[i] + ":" + port
+	}
+	return names
 }
 
 func (r *Router) FanOut(w http.ResponseWriter, req *http.Request) {

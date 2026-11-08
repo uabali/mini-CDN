@@ -92,7 +92,8 @@ seq 1 40 | xargs -P 20 -I{} curl -s -o /dev/null -w "%{http_code}\n" http://loca
 
 ## Design notes
 
-- Disk cache with in-memory index (rebuilt lazily).
+- Disk cache with in-memory index (rebuilt lazily). Concurrent misses of one object count its bytes once.
 - Stream while caching: origin body teed to client + temp file, then atomic rename.
-- Serve stale on origin failure (`X-Cache: STALE`).
-- Ring membership follows health probes.
+- Serve stale on origin failure (`X-Cache: STALE`) only if the client response has not started. A mid-body origin error is not followed by a second body.
+- Ring membership follows health probes. Distinct `host:port` values stay distinct when several edges share a hostname.
+- GET and HEAD try one other healthy edge when the selected edge fails before writing a response (`X-Edge-Failover`). POST is not retried.

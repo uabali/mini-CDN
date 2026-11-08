@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -153,5 +155,107 @@ func TestDiskCachePurgeAllKeepsRoot(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected empty cache root, got %d entries", len(entries))
+	}
+}
+
+func TestStaleServedWhenOriginIsDownBeforeWrite(t *testing.T) {
+	t.Parallel()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("STABLEDATA"))
+	}))
+
+	cache := NewDiskCache(t.TempDir(), origin.URL, "edge-test", time.Hour, 1024, metrics.NewRegistry())
+	req := httptest.NewRequest(http.MethodGet, "/images/obj.txt", nil)
+	first := httptest.NewRecorder()
+	cache.ServeFile(first, req, "/images/obj.txt")
+	if first.Body.String() != "STABLEDATA" {
+		t.Fatalf("first body = %q", first.Body.String())
+	}
+
+	origin.Close()
+	cache.mu.Lock()
+	cache.entries["/images/obj.txt"].CachedAt = time.Now().Add(-2 * time.Hour)
+	cache.mu.Unlock()
+
+	second := httptest.NewRecorder()
+	cache.ServeFile(second, req, "/images/obj.txt")
+	if second.Header().Get("X-Cache") != "STALE" {
+		t.Fatalf("X-Cache = %q", second.Header().Get("X-Cache"))
+	}
+	if second.Body.String() != "STABLEDATA" {
+		t.Fatalf("stale body = %q", second.Body.String())
+	}
+}
+
+func TestPartialOriginFailureDoesNotAppendStale(t *testing.T) {
+	t.Parallel()
+
+	var once sync.Once
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var first bool
+		once.Do(func() { first = true })
+		if first {
+			_, _ = w.Write([]byte("STABLEDATA"))
+			return
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("response writer cannot hijack")
+			return
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nPARTIAL")
+		_ = bufrw.Flush()
+	}))
+	defer origin.Close()
+
+	cache := NewDiskCache(t.TempDir(), origin.URL, "edge-test", time.Millisecond, 1024, metrics.NewRegistry())
+	req := httptest.NewRequest(http.MethodGet, "/images/obj.txt", nil)
+	first := httptest.NewRecorder()
+	cache.ServeFile(first, req, "/images/obj.txt")
+	time.Sleep(5 * time.Millisecond)
+
+	second := httptest.NewRecorder()
+	cache.ServeFile(second, req, "/images/obj.txt")
+	body := second.Body.String()
+	if !strings.Contains(body, "PARTIAL") || strings.Contains(body, "STABLEDATA") {
+		t.Fatalf("body = %q, want the partial origin bytes and not the cached object", body)
+	}
+	if got := second.Header().Get("X-Cache"); got != "MISS" {
+		t.Fatalf("X-Cache = %q, want MISS (stale must not be written after the response starts)", got)
+	}
+}
+
+func TestConcurrentMissCountsBytesOnce(t *testing.T) {
+	t.Parallel()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer origin.Close()
+
+	cache := NewDiskCache(t.TempDir(), origin.URL, "edge-test", time.Minute, 1024*1024, metrics.NewRegistry())
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/images/a.txt", nil)
+			rec := httptest.NewRecorder()
+			cache.ServeFile(rec, req, "/images/a.txt")
+		}()
+	}
+	wg.Wait()
+	cache.mu.Lock()
+	got := cache.totalBytes
+	cache.mu.Unlock()
+	if got != 5 {
+		t.Fatalf("totalBytes = %d, want 5", got)
 	}
 }

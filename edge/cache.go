@@ -63,7 +63,13 @@ func (c *DiskCache) ServeFile(w http.ResponseWriter, r *http.Request, cleanPath 
 		return
 	}
 
-	if err := c.fetchAndStream(w, r, cleanPath); err != nil {
+	tw := &committedWriter{ResponseWriter: w}
+	if err := c.fetchAndStream(tw, r, cleanPath); err != nil {
+		// Headers already went to the client. Appending a stale object would corrupt the body.
+		if tw.committed {
+			log.Printf("edge %s origin stream failed after response started for %s: %v", c.nodeName, cleanPath, err)
+			return
+		}
 		if entry, filePath, ok := c.staleEntry(cleanPath); ok {
 			c.metrics.Inc("cdn_cache_stale_serves_total", labels)
 			c.serveCached(w, r, filePath, entry, "STALE")
@@ -120,18 +126,23 @@ func (c *DiskCache) entryFromDisk(cleanPath string) (*CacheEntry, string, bool) 
 		return nil, "", false
 	}
 
-	entry = &CacheEntry{
+	fresh := &CacheEntry{
 		Path:       cleanPath,
 		Size:       stat.Size(),
 		CachedAt:   stat.ModTime(),
 		LastAccess: stat.ModTime(),
 	}
 	c.mu.Lock()
-	c.entries[cleanPath] = entry
-	c.totalBytes += entry.Size
+	// Two misses can stat the same file before either inserts. Count the bytes once.
+	if existing := c.entries[cleanPath]; existing != nil {
+		c.mu.Unlock()
+		return existing, filePath, true
+	}
+	c.entries[cleanPath] = fresh
+	c.totalBytes += fresh.Size
 	c.metrics.SetGauge("cdn_cache_bytes", map[string]string{"edge": c.nodeName}, float64(c.totalBytes))
 	c.mu.Unlock()
-	return entry, filePath, true
+	return fresh, filePath, true
 }
 
 func (c *DiskCache) serveCached(w http.ResponseWriter, r *http.Request, filePath string, entry *CacheEntry, cacheStatus string) {
@@ -222,7 +233,27 @@ func (c *DiskCache) fetchAndStream(w http.ResponseWriter, r *http.Request, clean
 	c.metrics.SetGauge("cdn_cache_bytes", map[string]string{"edge": c.nodeName}, float64(c.totalBytes))
 	c.mu.Unlock()
 
-	return c.evictIfNeeded(cleanPath)
+	// The client already has a full 200. An eviction error must not be reported as a failed fetch
+	// (that path would try to write a stale body after this response).
+	if err := c.evictIfNeeded(cleanPath); err != nil {
+		log.Printf("edge %s eviction after caching %s: %v", c.nodeName, cleanPath, err)
+	}
+	return nil
+}
+
+type committedWriter struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (w *committedWriter) WriteHeader(status int) {
+	w.committed = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *committedWriter) Write(p []byte) (int, error) {
+	w.committed = true
+	return w.ResponseWriter.Write(p)
 }
 
 func (c *DiskCache) Purge(cleanPath string) error {
